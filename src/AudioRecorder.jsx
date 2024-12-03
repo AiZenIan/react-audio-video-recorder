@@ -89,7 +89,7 @@ const AudioRecorder = () => {
       const arrayBuffer = await audioBlob.arrayBuffer();
 
       // Decode the audio data
-      const audioContext = new AudioContext();
+      const audioContext = new (window.AudioContext || window.webkitAudioContext)();
       const decodedAudio = await audioContext.decodeAudioData(arrayBuffer);
 
       // Resample to 24kHz, 1 channel, PCM16 format
@@ -143,50 +143,49 @@ const AudioRecorder = () => {
   };
 
   const sendAudioToWebSocket = (base64Audio) => {
-	if (websocketRef.current && websocketRef.current.readyState === WebSocket.OPEN) {
-	  const message = {
-		type: "conversation.item.create",
-		item: {
-		  type: "message",
-		  role: "user",
-		  content: [
-			{
-			  type: "input_audio",
-			  audio: base64Audio,
-			},
-		  ],
-		},
-	  };
+    if (websocketRef.current && websocketRef.current.readyState === WebSocket.OPEN) {
+      const message = {
+        type: "conversation.item.create",
+        item: {
+          type: "message",
+          role: "user",
+          content: [
+            {
+              type: "input_audio",
+              audio: base64Audio,
+            },
+          ],
+        },
+      };
   
-	  websocketRef.current.send(JSON.stringify(message));
-	  console.log("Audio sent to WebSocket server.");
+      websocketRef.current.send(JSON.stringify(message));
+      console.log("Audio sent to WebSocket server.");
   
-	  // Send a response.create message to request the assistant's response
-	  const responseCreateMessage = { type: "response.create" };
-	  websocketRef.current.send(JSON.stringify(responseCreateMessage));
-	  console.log("Sent response.create to request a response from the assistant.");
-	} else {
-	  console.error("WebSocket is not connected.");
-	}
+      // Send a response.create message to request the assistant's response
+      const responseCreateMessage = { type: "response.create" };
+      websocketRef.current.send(JSON.stringify(responseCreateMessage));
+      console.log("Sent response.create to request a response from the assistant.");
+    } else {
+      console.error("WebSocket is not connected.");
+    }
   };
 
   const handleServerMessage = async (message) => {
     console.log("Received message from server:", message);
-  try {
-    const parsedMessage = JSON.parse(message);
-    if (parsedMessage.type === "error") {
-      console.error("Error from server:", parsedMessage.error);
-      return;
-    } {
-        const content = parsedMessage.item.content;
-        for (const part of content) {
-          if (part.type === "output_audio") {
-            const audioBase64 = part.audio;
-            console.log("Audio received:", audioBase64);
-            await playAudioFromBase64(audioBase64);
-          }
-        }
+    try {
+      const parsedMessage = JSON.parse(message);
+      if (parsedMessage.type === "error") {
+        console.error("Error from server:", parsedMessage.error);
+        return;
       }
+
+      if (parsedMessage.type === "output_audio") {
+        const audioBase64 = parsedMessage.audio;
+        console.log("Audio received:", audioBase64);
+        await playAudioFromBase64(audioBase64);
+      }
+
+      // Handle other message types if necessary
     } catch (err) {
       console.error("Error handling server message:", err);
     }
@@ -194,10 +193,19 @@ const AudioRecorder = () => {
 
   const playAudioFromBase64 = async (base64Audio) => {
     try {
-      const audioContext = new AudioContext();
-      const audioBuffer = Uint8Array.from(atob(base64Audio), (c) => c.charCodeAt(0)).buffer;
-      const decodedAudio = await audioContext.decodeAudioData(audioBuffer);
+      // Decode Base64 to ArrayBuffer
+      const binaryString = atob(base64Audio);
+      const len = binaryString.length;
+      const bytes = new Uint8Array(len);
+      for (let i = 0; i < len; i++) {
+        bytes[i] = binaryString.charCodeAt(i);
+      }
 
+      // Decode audio data
+      const audioContext = new (window.AudioContext || window.webkitAudioContext)();
+      const decodedAudio = await audioContext.decodeAudioData(bytes.buffer);
+
+      // Create a buffer source and play the audio
       const source = audioContext.createBufferSource();
       source.buffer = decodedAudio;
       source.connect(audioContext.destination);
@@ -223,7 +231,9 @@ const AudioRecorder = () => {
           <button onClick={stopRecording}>Stop Recording</button>
         ) : null}
         {audioBlob && recordingStatus === "inactive" ? (
-          <button onClick={sendAudio}>Send Audio</button>
+          <>
+            <button onClick={sendAudio}>Send Audio</button>
+          </>
         ) : null}
       </div>
     </div>
