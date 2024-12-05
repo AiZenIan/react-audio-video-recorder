@@ -11,6 +11,8 @@ const AudioRecorder = () => {
 
   const mediaRecorder = useRef(null);
   const websocketRef = useRef(null);
+  const audioContextRef = useRef(null);
+  const workletNodeRef = useRef(null);
 
   const getMicrophonePermission = async () => {
     if ("MediaRecorder" in window) {
@@ -21,6 +23,15 @@ const AudioRecorder = () => {
         });
         setPermission(true);
         setStream(mediaStream);
+
+        // Setup AudioContext and AudioWorklet
+        const audioContext = new (window.AudioContext || window.webkitAudioContext)();
+        audioContextRef.current = audioContext;
+
+        await audioContext.audioWorklet.addModule('audio-worklet-processor.js');
+        const workletNode = new AudioWorkletNode(audioContext, 'pcm-player-processor');
+        workletNode.connect(audioContext.destination);
+        workletNodeRef.current = workletNode;
 
         // Initialize WebSocket
         websocketRef.current = new WebSocket("ws://localhost:3000/ws");
@@ -88,12 +99,12 @@ const AudioRecorder = () => {
       // Convert Blob to ArrayBuffer
       const arrayBuffer = await audioBlob.arrayBuffer();
 
-      // Decode the audio data
-      const audioContext = new (window.AudioContext || window.webkitAudioContext)();
-      const decodedAudio = await audioContext.decodeAudioData(arrayBuffer);
+      // Decode the audio data at its native rate
+      const tempCtx = new (window.AudioContext || window.webkitAudioContext)();
+      const decodedAudio = await tempCtx.decodeAudioData(arrayBuffer);
 
-      // Resample to 24kHz, 1 channel, PCM16 format
-      const resampledBuffer = await resampleAudio(decodedAudio, 24000, 1);
+      // Resample to 16 kHz mono PCM16 because that's what the server expects
+      const resampledBuffer = await resampleAudio(decodedAudio, 16000, 1);
       const pcmData = convertToPCM16(resampledBuffer);
 
       // Encode PCM data to Base64
@@ -109,7 +120,7 @@ const AudioRecorder = () => {
   const resampleAudio = async (audioBuffer, targetSampleRate, numChannels) => {
     const offlineContext = new OfflineAudioContext(
       numChannels,
-      (audioBuffer.length * targetSampleRate) / audioBuffer.sampleRate,
+      Math.ceil((audioBuffer.length * targetSampleRate) / audioBuffer.sampleRate),
       targetSampleRate
     );
 
@@ -157,20 +168,20 @@ const AudioRecorder = () => {
           ],
         },
       };
-  
+
       websocketRef.current.send(JSON.stringify(message));
       console.log("Audio sent to WebSocket server.");
-  
-      // Send a response.create message to request the assistant's response
+
+      // Request a response from the assistant
       const responseCreateMessage = { type: "response.create" };
       websocketRef.current.send(JSON.stringify(responseCreateMessage));
-      console.log("Sent response.create to request a response from the assistant.");
+      console.log("Sent response.create.");
     } else {
       console.error("WebSocket is not connected.");
     }
   };
 
-  const handleServerMessage = async (message) => {
+  const handleServerMessage = (message) => {
     console.log("Received message from server:", message);
     try {
       const parsedMessage = JSON.parse(message);
@@ -181,40 +192,58 @@ const AudioRecorder = () => {
 
       if (parsedMessage.type === "output_audio") {
         const audioBase64 = parsedMessage.audio;
-        console.log("Audio received:", audioBase64);
-        await playAudioFromBase64(audioBase64);
+
+        // Convert base64 to Int16 PCM (16kHz)
+        const int16Data = base64ToInt16(audioBase64);
+        // Convert to Float32
+        const float32Data = int16ToFloat32(int16Data);
+        // Resample from 16kHz to audioContext.sampleRate for correct playback speed
+        const resampledData = resampleFloat32(float32Data, 24000, audioContextRef.current.sampleRate);
+
+        // Send resampled float32 data to the processor
+        if (workletNodeRef.current) {
+          workletNodeRef.current.port.postMessage(resampledData);
+        }
       }
 
-      // Handle other message types if necessary
     } catch (err) {
       console.error("Error handling server message:", err);
     }
   };
 
-  const playAudioFromBase64 = async (base64Audio) => {
-    try {
-      // Decode Base64 to ArrayBuffer
-      const binaryString = atob(base64Audio);
-      const len = binaryString.length;
-      const bytes = new Uint8Array(len);
-      for (let i = 0; i < len; i++) {
-        bytes[i] = binaryString.charCodeAt(i);
-      }
-
-      // Decode audio data
-      const audioContext = new (window.AudioContext || window.webkitAudioContext)();
-      const decodedAudio = await audioContext.decodeAudioData(bytes.buffer);
-
-      // Create a buffer source and play the audio
-      const source = audioContext.createBufferSource();
-      source.buffer = decodedAudio;
-      source.connect(audioContext.destination);
-      source.start();
-
-      console.log("Audio playback started.");
-    } catch (err) {
-      console.error("Error during audio playback:", err);
+  const base64ToInt16 = (base64) => {
+    const binaryString = atob(base64);
+    const len = binaryString.length;
+    const bytes = new Int16Array(len / 2);
+    for (let i = 0; i < len; i += 2) {
+      bytes[i / 2] = (binaryString.charCodeAt(i)) | (binaryString.charCodeAt(i+1) << 8);
     }
+    return bytes;
+  };
+
+  const int16ToFloat32 = (int16Data) => {
+    const float32Data = new Float32Array(int16Data.length);
+    for (let i = 0; i < int16Data.length; i++) {
+      float32Data[i] = int16Data[i] / 32768;
+    }
+    return float32Data;
+  };
+
+  const resampleFloat32 = (inputSamples, inputRate, outputRate) => {
+    if (inputRate === outputRate) {
+      return inputSamples;
+    }
+    const ratio = outputRate / inputRate;
+    const outputLength = Math.floor(inputSamples.length * ratio);
+    const output = new Float32Array(outputLength);
+    for (let i = 0; i < outputLength; i++) {
+      const index = i / ratio;
+      const low = Math.floor(index);
+      const high = Math.min(low + 1, inputSamples.length - 1);
+      const t = index - low;
+      output[i] = inputSamples[low] * (1 - t) + inputSamples[high] * t;
+    }
+    return output;
   };
 
   return (
@@ -231,9 +260,7 @@ const AudioRecorder = () => {
           <button onClick={stopRecording}>Stop Recording</button>
         ) : null}
         {audioBlob && recordingStatus === "inactive" ? (
-          <>
-            <button onClick={sendAudio}>Send Audio</button>
-          </>
+          <button onClick={sendAudio}>Send Audio</button>
         ) : null}
       </div>
     </div>
